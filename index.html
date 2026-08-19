@@ -18,6 +18,7 @@
         .video-container { position: relative; max-width: 640px; margin: 0 auto; }
         video { width: 100%; border: 3px solid #d32f2f; border-radius: 8px; background: #000; display: block; }
 
+        #overlayCanvas { position: absolute; top: 3px; left: 3px; width: calc(100% - 6px); height: calc(100% - 6px); border-radius: 6px; pointer-events: none; }
         .watermark { position: absolute; top: 10px; left: 10px; background: rgba(211, 47, 47, 0.85); color: white; padding: 4px 12px; font-weight: bold; font-size: 0.85rem; border-radius: 4px; pointer-events: none; }
         .warning-bar { background: #d32f2f; color: white; font-weight: bold; padding: 8px; font-size: 0.9rem; border-radius: 0 0 8px 8px; max-width: 624px; margin: 0 auto 15px auto; }
 
@@ -62,6 +63,7 @@
 
     <div class="video-container">
         <video id="previewVideo" autoplay playsinline muted></video>
+        <canvas id="overlayCanvas" class="hidden"></canvas>
         <div class="watermark">⚠️ MONITORING SYSTEM ACTIVE</div>
     </div>
     <div class="warning-bar">🚨 本システムは簡易防犯用監視ツールです</div>
@@ -72,6 +74,28 @@
     <div>
         <button class="start-btn" id="startBtn">監視スタート</button>
         <button class="stop-btn" id="stopBtn" disabled>完全停止</button>
+    </div>
+
+    <div>
+        <button class="sub-btn" id="testBtn" style="margin-top:10px;">🎯 設置チェック（カメラの向きと感度を確かめる）</button>
+    </div>
+
+    <!-- 🎯 設置チェックパネル（初期非表示） -->
+    <div id="testPanel" class="panel hidden" style="text-align:center;">
+        <div class="panel-title" style="justify-content:center;">🎯 設置チェック中（録画はしていません）</div>
+        <div id="testVerdict" style="font-size:1.1rem; font-weight:bold; margin:10px 0; color:#4caf50;">カメラの前を歩いてみてください</div>
+        <div style="font-size:0.9rem;">いま反応しているマス: <b id="testBlocks">0</b> ／ 録画が始まるライン: <b id="testThreshold">4</b></div>
+        <div style="font-size:0.9rem; margin-top:4px;">この30秒で録画が始まった回数: <b id="testHits">0</b></div>
+        <div style="margin-top:10px; text-align:left;">
+            <label for="testSensitivity">感度（ここで変えるとその場で試せます）:</label>
+            <select id="testSensitivity">
+                <option value="2">高感度：遠くの動き（小さな変化を捉える）</option>
+                <option value="4">標準感度：中距離（一般的な畑・ハウス前）</option>
+                <option value="6">低感度：近距離専用（木々の揺れが多い場所）</option>
+            </select>
+        </div>
+        <p style="color:#aaa; font-size:0.78rem; text-align:left; margin:8px 0 0 0;">※誰も通っていないのに回数が増える → 感度を下げてください。<br>※人が通っても赤くならない → 感度を上げるか、カメラを近づけてください。</p>
+        <button class="sub-btn" id="testStopBtn" style="margin-top:10px;">チェックを終わる</button>
     </div>
 
     <!-- ⚙️ モード切り替え・ユーティリティリンク -->
@@ -195,6 +219,17 @@
     const cameraSelect = document.getElementById('cameraSelect');
     const detectCamBtn = document.getElementById('detectCamBtn');
     const lastSaveLog = document.getElementById('lastSaveLog');
+
+    // 設置チェック用
+    const overlayCanvas = document.getElementById('overlayCanvas');
+    const testBtn = document.getElementById('testBtn');
+    const testPanel = document.getElementById('testPanel');
+    const testStopBtn = document.getElementById('testStopBtn');
+    const testVerdict = document.getElementById('testVerdict');
+    const testBlocksSpan = document.getElementById('testBlocks');
+    const testThresholdSpan = document.getElementById('testThreshold');
+    const testHitsSpan = document.getElementById('testHits');
+    const testSensitivity = document.getElementById('testSensitivity');
 
     // 設定項目
     const cropNameInput = document.getElementById('cropName');
@@ -433,6 +468,7 @@
         stopBtn.disabled = false;
         cameraSelect.disabled = true;
         detectCamBtn.disabled = true;
+        testBtn.disabled = true;
         requestWakeLock();
         manageSystemState();
         scheduleTimer = setInterval(manageSystemState, 60000);
@@ -530,6 +566,7 @@
         stopBtn.disabled = true;
         cameraSelect.disabled = false;
         detectCamBtn.disabled = false;
+        testBtn.disabled = false;
     });
 
     function processVideoChunk(blob) {
@@ -551,6 +588,70 @@
                 executeQueueSave();
             }
         }
+    }
+
+    // 🔬 1フレーム解析（監視モードと設置チェックモードで共通に使う）
+    function analyzeFrame(prevData, wantFlags) {
+        if (previewVideo.videoWidth === 0) return null;
+
+        const widthBlocks = 16;
+        const blockSize = Math.floor(previewVideo.videoWidth / widthBlocks);
+        if (blockSize < 1) return null;
+
+        if (procCanvas.width !== previewVideo.videoWidth) {
+            procCanvas.width = previewVideo.videoWidth;
+            procCanvas.height = previewVideo.videoHeight;
+        }
+
+        pCtx.drawImage(previewVideo, 0, 0, procCanvas.width, procCanvas.height);
+        const img = pCtx.getImageData(0, 0, procCanvas.width, procCanvas.height);
+
+        const gridCols = Math.floor(procCanvas.width / blockSize);
+        const gridRows = Math.floor(procCanvas.height / blockSize);
+        const totalBlocks = gridCols * gridRows;
+
+        const colors = new Uint8Array(totalBlocks * 3);
+        let bIdx = 0;
+        for (let gy = 0; gy < gridRows; gy++) {
+            for (let gx = 0; gx < gridCols; gx++) {
+                const centerX = gx * blockSize + Math.floor(blockSize / 2);
+                const centerY = gy * blockSize + Math.floor(blockSize / 2);
+                const pixelIdx = (centerY * procCanvas.width + centerX) * 4;
+                colors[bIdx * 3]     = img.data[pixelIdx];
+                colors[bIdx * 3 + 1] = img.data[pixelIdx + 1];
+                colors[bIdx * 3 + 2] = img.data[pixelIdx + 2];
+                bIdx++;
+            }
+        }
+
+        const comparable = !!(prevData && prevData.length === colors.length);
+        const flags = wantFlags ? new Uint8Array(totalBlocks) : null;
+        let changedBlockCount = 0;
+        let totalDiffSum = 0;
+
+        if (comparable) {
+            for (let i = 0; i < totalBlocks; i++) {
+                const rDiff = Math.abs(colors[i*3] - prevData[i*3]);
+                const gDiff = Math.abs(colors[i*3+1] - prevData[i*3+1]);
+                const bDiff = Math.abs(colors[i*3+2] - prevData[i*3+2]);
+
+                const yDiff = 0.299 * rDiff + 0.587 * gDiff + 0.114 * bDiff;
+                const colorDiff = (rDiff + gDiff + bDiff) / 3;
+
+                totalDiffSum += yDiff;
+
+                if (yDiff > BRIGHTNESS_THRESHOLD || colorDiff > COLOR_THRESHOLD) {
+                    changedBlockCount++;
+                    if (flags) flags[i] = 1;
+                }
+            }
+        }
+
+        return {
+            colors, comparable, flags, gridCols, gridRows, blockSize,
+            changedBlockCount,
+            averageGlobalDiff: totalBlocks ? totalDiffSum / totalBlocks : 0
+        };
     }
 
     // ⚙️ 動体検知ロジック
@@ -578,67 +679,15 @@
             lagStrikes = Math.max(0, lagStrikes - 1);
         }
 
-        const widthBlocks = 16;
-        const calculatedBlockSize = Math.floor(previewVideo.videoWidth / widthBlocks);
-        if (calculatedBlockSize < 1) return;
-
-        if (procCanvas.width !== previewVideo.videoWidth) {
-            procCanvas.width = previewVideo.videoWidth;
-            procCanvas.height = previewVideo.videoHeight;
-            lastFrameData = null; // ★解像度が変わったら前フレームは比較に使えない
-        }
-
-        pCtx.drawImage(previewVideo, 0, 0, procCanvas.width, procCanvas.height);
-        const currentImgData = pCtx.getImageData(0, 0, procCanvas.width, procCanvas.height);
-
-        const gridCols = Math.floor(procCanvas.width / calculatedBlockSize);
-        const gridRows = Math.floor(procCanvas.height / calculatedBlockSize);
-        const totalBlocks = gridCols * gridRows;
-
-        const currentFrameColors = new Uint8Array(totalBlocks * 3);
-        let bIdx = 0;
-
-        for (let gy = 0; gy < gridRows; gy++) {
-            for (let gx = 0; gx < gridCols; gx++) {
-                const centerX = gx * calculatedBlockSize + Math.floor(calculatedBlockSize / 2);
-                const centerY = gy * calculatedBlockSize + Math.floor(calculatedBlockSize / 2);
-                const pixelIdx = (centerY * procCanvas.width + centerX) * 4;
-
-                currentFrameColors[bIdx * 3]     = currentImgData.data[pixelIdx];
-                currentFrameColors[bIdx * 3 + 1] = currentImgData.data[pixelIdx + 1];
-                currentFrameColors[bIdx * 3 + 2] = currentImgData.data[pixelIdx + 2];
-                bIdx++;
-            }
-        }
+        const result = analyzeFrame(lastFrameData, false);
+        if (!result) return;
+        lastFrameData = result.colors;
 
         let motionDetectedThisFrame = false;
-        if (lastFrameData && lastFrameData.length === currentFrameColors.length) {
-            let changedBlockCount = 0;
-            let totalDiffSum = 0;
-
-            for (let i = 0; i < totalBlocks; i++) {
-                const rDiff = Math.abs(currentFrameColors[i*3] - lastFrameData[i*3]);
-                const gDiff = Math.abs(currentFrameColors[i*3+1] - lastFrameData[i*3+1]);
-                const bDiff = Math.abs(currentFrameColors[i*3+2] - lastFrameData[i*3+2]);
-
-                const yDiff = 0.299 * rDiff + 0.587 * gDiff + 0.114 * bDiff;
-                const colorDiff = (rDiff + gDiff + bDiff) / 3;
-
-                totalDiffSum += yDiff;
-
-                if (yDiff > BRIGHTNESS_THRESHOLD || colorDiff > COLOR_THRESHOLD) {
-                    changedBlockCount++;
-                }
-            }
-
-            const averageGlobalDiff = totalDiffSum / totalBlocks;
+        if (result.comparable && result.averageGlobalDiff < 15) {
             const triggerThreshold = parseInt(sensitivitySelect.value, 10);
-
-            if (averageGlobalDiff < 15) {
-                if (changedBlockCount >= triggerThreshold) motionDetectedThisFrame = true;
-            }
+            if (result.changedBlockCount >= triggerThreshold) motionDetectedThisFrame = true;
         }
-        lastFrameData = currentFrameColors;
 
         if (motionDetectedThisFrame) { continuousMotionCount++; } else { continuousMotionCount = Math.max(0, continuousMotionCount - 1); }
 
@@ -648,6 +697,136 @@
             preEventCount = saveQueue.length; // ★事件後チャンク数を正しく数えるため
             statusDiv.textContent = "🚨 変化検知：映像データを確定書き出し中..."; statusDiv.className = "status recording";
             continuousMotionCount = 0;
+        }
+    }
+
+    // 🎯 設置チェックモード（録画せずに、検知の様子だけをその場で見せる）
+    let isTestMode = false; let testTimer = null; let lastTestFrameData = null;
+    let testContinuous = 0; let testHitTimes = [];
+
+    testBtn.addEventListener('click', startTestMode);
+    testStopBtn.addEventListener('click', stopTestMode);
+
+    testSensitivity.addEventListener('change', () => {
+        sensitivitySelect.value = testSensitivity.value;
+        saveSettingsToStorage();
+        testThresholdSpan.textContent = testSensitivity.value;
+        testContinuous = 0; testHitTimes = [];
+        testHitsSpan.textContent = "0";
+    });
+
+    async function startTestMode() {
+        if (isRunning || isTestMode) return;
+
+        testSensitivity.value = sensitivitySelect.value;
+        testThresholdSpan.textContent = testSensitivity.value;
+
+        const selectedCameraId = cameraSelect.value;
+        const videoConstraints = selectedCameraId ? { deviceId: { exact: selectedCameraId }, width: 640, height: 480 } : { facingMode: "environment", width: 640, height: 480 };
+
+        try {
+            localStream = await navigator.mediaDevices.getUserMedia({ video: videoConstraints, audio: false });
+        } catch (e) {
+            try {
+                localStream = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 }, audio: false });
+            } catch (err2) {
+                alert("カメラを起動できませんでした。ブラウザのカメラ許可がオンになっているか、他のアプリがカメラを使っていないか確認してください。");
+                return;
+            }
+        }
+
+        previewVideo.srcObject = localStream;
+        enumerateCameras(false);
+
+        isTestMode = true;
+        lastTestFrameData = null; testContinuous = 0; testHitTimes = [];
+        testBlocksSpan.textContent = "0"; testHitsSpan.textContent = "0";
+
+        overlayCanvas.classList.remove('hidden');
+        testPanel.classList.remove('hidden');
+        testBtn.classList.add('hidden');
+        startBtn.disabled = true;
+        cameraSelect.disabled = true;
+        detectCamBtn.disabled = true;
+
+        statusDiv.textContent = "🎯 設置チェック中（録画はしていません）"; statusDiv.className = "status buffering";
+        testTimer = setInterval(runTestFrame, DETECT_INTERVAL);
+    }
+
+    function stopTestMode() {
+        isTestMode = false;
+        clearInterval(testTimer); testTimer = null;
+        if (localStream) { localStream.getTracks().forEach(t => t.stop()); localStream = null; }
+        previewVideo.srcObject = null;
+
+        const octx = overlayCanvas.getContext('2d');
+        octx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
+        overlayCanvas.classList.add('hidden');
+        testPanel.classList.add('hidden');
+        testBtn.classList.remove('hidden');
+        startBtn.disabled = false;
+        cameraSelect.disabled = false;
+        detectCamBtn.disabled = false;
+
+        statusDiv.textContent = "システム待機中"; statusDiv.className = "status idle";
+    }
+
+    function runTestFrame() {
+        const result = analyzeFrame(lastTestFrameData, true);
+        if (!result) return;
+        lastTestFrameData = result.colors;
+
+        // 反応したマスを映像に重ねて赤く塗る
+        if (overlayCanvas.width !== procCanvas.width || overlayCanvas.height !== procCanvas.height) {
+            overlayCanvas.width = procCanvas.width;
+            overlayCanvas.height = procCanvas.height;
+        }
+        const octx = overlayCanvas.getContext('2d');
+        octx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
+
+        if (result.flags) {
+            octx.fillStyle = "rgba(255, 82, 82, 0.45)";
+            octx.strokeStyle = "rgba(255, 82, 82, 0.95)";
+            octx.lineWidth = 2;
+            for (let i = 0; i < result.flags.length; i++) {
+                if (!result.flags[i]) continue;
+                const x = (i % result.gridCols) * result.blockSize;
+                const y = Math.floor(i / result.gridCols) * result.blockSize;
+                octx.fillRect(x, y, result.blockSize, result.blockSize);
+                octx.strokeRect(x, y, result.blockSize, result.blockSize);
+            }
+        }
+
+        const threshold = parseInt(testSensitivity.value, 10);
+        testBlocksSpan.textContent = result.changedBlockCount;
+
+        // 監視モードとまったく同じ判定条件で動かす
+        const brightnessJump = result.comparable && result.averageGlobalDiff >= 15;
+        let hitNow = false;
+        if (result.comparable && !brightnessJump && result.changedBlockCount >= threshold) {
+            testContinuous++;
+            if (testContinuous >= 4) { hitNow = true; testContinuous = 0; }
+        } else {
+            testContinuous = Math.max(0, testContinuous - 1);
+        }
+
+        const now = Date.now();
+        if (hitNow) testHitTimes.push(now);
+        testHitTimes = testHitTimes.filter(t => now - t <= 30000);
+        testHitsSpan.textContent = testHitTimes.length;
+
+        if (brightnessJump) {
+            testVerdict.textContent = "🌤 画面全体の明暗変化（雲や日射なので録画しません）";
+            testVerdict.style.color = "#ff9800";
+        } else if (hitNow || testContinuous >= 2) {
+            testVerdict.textContent = "🚨 反応中：この動きなら録画が始まります";
+            testVerdict.style.color = "#ff5252";
+        } else if (result.changedBlockCount >= threshold) {
+            testVerdict.textContent = "⚡ 反応しかけています";
+            testVerdict.style.color = "#ffd54f";
+        } else {
+            testVerdict.textContent = "🟢 静かです（カメラの前を歩いてみてください）";
+            testVerdict.style.color = "#4caf50";
         }
     }
 
